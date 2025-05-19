@@ -24,7 +24,7 @@ import threading
 import queue
 import re
 import warnings
-
+from prompts import initial_context_prompt
 
 print(f"🔑 API KEY: {os.getenv('OPENAI_API_KEY')[:20]}... (parcial)")
 
@@ -38,7 +38,9 @@ from langchain.schema.runnable import RunnablePassthrough
 from indicators import calculate_atr, calculate_directional_entropy, calculate_ema
 from utils import parse_llm_response, format_trade_for_feedback, calculate_position_performance, detect_price_patterns
 # Adicione este código no início do arquivo app.py, após as importações
-
+# Add this with other global variables near the top
+initial_market_context = None
+use_initial_context_enabled = False
 # Custom CSS para melhorar a aparência da interface
 app_css = """
 /* Chat styles */
@@ -975,11 +977,12 @@ def extract_key_factors(reasoning_text):
         return html.P("Analysis doesn't contain specific factors", className="text-muted")
 
 # Modificação na função analyze_market para extrair mais informações
-def analyze_market(symbol, timeframe, use_initial_context=False):
+def analyze_market(symbol, timeframe):
     """Analyze market using LLM"""
     global llm_reasoning, confidence_level, market_direction, llm_chain
+    global initial_market_context, use_initial_context_enabled
     
-    # Verificar posições atuais no MetaTrader5
+    # Verify positions and get position info
     positions = mt5.positions_get(symbol=symbol)
     position_info = ""
     
@@ -991,11 +994,6 @@ def analyze_market(symbol, timeframe, use_initial_context=False):
     # Get support resistance levels as string
     sr_str = "\n".join([f"Level {i+1}: {level}" for i, level in enumerate(support_resistance_levels)])
     
-    # Get initial context if needed
-    context = "{}"
-    if use_initial_context:
-        context = get_initial_context(symbol, timeframe)
-    
     # Get current market data
     market_data = get_current_candle_data(symbol, timeframe)
     
@@ -1003,16 +1001,33 @@ def analyze_market(symbol, timeframe, use_initial_context=False):
     if position_info:
         # Try to add to context as JSON data
         try:
-            context_dict = json.loads(context)
+            context_dict = json.loads(market_data)
             context_dict["mt5_positions"] = position_info
-            context = json.dumps(context_dict)
+            market_data = json.dumps(context_dict)
         except:
             # If that fails, just keep context as is
             pass
     
-    # Run LLM analysis using the existing chain without modifications
+    # Prepare context data, including historical context if enabled
+    if use_initial_context_enabled and initial_market_context:
+        # Get a small amount of recent context to supplement the historical view
+        recent_data = get_initial_context(symbol, timeframe, num_candles=2) #________________________________________________________________________________quantia de candles da analize a cada novo candle
+        
+        # Combine historical and recent context
+        context = f"""
+# Long-Term Historical Market Analysis (H4 Timeframe)
+{initial_market_context}
+
+# Recent Market Context ({timeframe} Timeframe)
+{recent_data}
+"""
+    else:
+        # If not using initial context, just use standard context
+        context = get_initial_context(symbol, timeframe, num_candles=2)
+    
+    # Run LLM analysis using the existing chain
     try:
-        # Use the existing llm_chain exactly as it was defined originally
+        # Use the existing llm_chain
         response = llm_chain.invoke({
             "context": context,
             "market_data": market_data,
@@ -1021,10 +1036,8 @@ def analyze_market(symbol, timeframe, use_initial_context=False):
             "max_contracts": max_contracts
         })
         
-        # Convert the response to text
+        # Process response as before
         response_text = response.content
-        
-        # Parse response using utility function
         analysis = parse_llm_response(response_text)
         
         # Update global variables
@@ -1047,7 +1060,6 @@ def analyze_market(symbol, timeframe, use_initial_context=False):
             "reasoning": f"Error in LLM analysis: {str(e)}",
             "contracts_to_adjust": 0
         }
-    
 def update_trade_history(n_intervals):
     """Update trade history display"""
     if not trade_history:
@@ -1083,7 +1095,7 @@ def update_trade_history(n_intervals):
         history_cards.append(card)
     
     return history_cards
-def get_initial_context(symbol, timeframe, num_candles=10):
+def get_initial_context(symbol, timeframe, num_candles=3):
     """Get initial market context for LLM"""
     if timeframe not in timeframe_dict:
         return "Invalid timeframe"
@@ -1936,7 +1948,7 @@ def update_max_contracts(n_clicks, max_contracts_value):
 )
 def control_trading(start_clicks, stop_clicks, symbol, timeframe, use_context):
     """Control trading process"""
-    global running, llm_chain, trade_queue
+    global running, llm_chain, trade_queue, initial_market_context, use_initial_context_enabled
     
     # Get the button that triggered the callback
     ctx = callback_context
@@ -1951,19 +1963,59 @@ def control_trading(start_clicks, stop_clicks, symbol, timeframe, use_context):
         if llm_chain is None:
             initialize_llm_chain()
         
+        # Set the global flag for using initial context
+        use_initial_context_enabled = bool(use_context)
+        
+        # If enabled, get and analyze initial context ONCE at startup
+        if use_initial_context_enabled:
+            try:
+                print("Getting initial market context...")
+                # Get historical data for H4 timeframe
+                historical_data = get_initial_context(symbol, "H4", num_candles=15) #____________________________________________________________ quantia de candles para a analize H4 do langchain
+                
+                # Use your existing initial_context_prompt from prompts.py
+                from prompts import initial_context_prompt
+                
+                # Create LLM for historical analysis
+                history_llm = ChatOpenAI(
+                    temperature=0.1,
+                    api_key=os.getenv("OPENAI_API_KEY"),
+                    model_name="gpt-3.5-turbo"
+                )
+                
+                # Create a chain for historical analysis using your existing prompt
+                historical_chain = (
+                    {"historical_data": lambda x: historical_data}
+                    | initial_context_prompt 
+                    | history_llm
+                )
+                
+                # Run the historical analysis
+                response = historical_chain.invoke({})
+                
+                # Store the result in the global variable
+                if isinstance(response.content, str):
+                    initial_market_context = response.content
+                else:
+                    # Format the JSON response for display in the prompt
+                    initial_market_context = json.dumps(response.content, indent=2)
+                
+                print("Initial market context analysis completed and stored.")
+                
+            except Exception as e:
+                print(f"Error getting initial context: {e}")
+                import traceback
+                traceback.print_exc()
+                initial_market_context = None
+        else:
+            # Reset the initial context if not using it
+            initial_market_context = None
+        
         # Start trading loop
         running = True
         trading_thread = threading.Thread(target=trading_loop, args=(symbol, timeframe))
         trading_thread.daemon = True
         trading_thread.start()
-        
-        # If enabled, get initial context
-        if use_context:
-            try:
-                context = get_initial_context(symbol, timeframe)
-                print("Initial context obtained")
-            except Exception as e:
-                print(f"Error getting initial context: {e}")
         
         return [True, False, False]
     
@@ -1978,7 +2030,6 @@ def control_trading(start_clicks, stop_clicks, symbol, timeframe, use_context):
     
     # Default state
     return [False, True, True]
-
 @app.callback(
     Output("analyze-button", "n_clicks"),
     [Input("analyze-button", "n_clicks")],
