@@ -847,6 +847,7 @@ import numpy as np
      Output("reasoning-display", "children"),
      Output("confidence-value", "children"),
      Output("key-factors", "children"),
+     Output("past-market-context", "children"),  # Add this new output
      Output("last-llm-analysis", "data")],
     [Input("interval-component", "n_intervals"),
      Input("analyze-button", "n_clicks")],
@@ -854,6 +855,8 @@ import numpy as np
 )
 def update_dashboard(n_intervals, n_clicks, last_analysis):
     """Update dashboard elements"""
+    global initial_market_context, use_initial_context_enabled
+    
     # Format position display
     position_text = f"{current_position} Contracts"
     
@@ -867,23 +870,13 @@ def update_dashboard(n_intervals, n_clicks, last_analysis):
     confidence_bar_value = (confidence_level + 100) / 2
     
     # Determine bar color based on confidence level
-    # if confidence_level < -50:
-    #     bar_color = "danger"  # Red for very bearish
-    # elif confidence_level < -20:
-    #     bar_color = "warning"  # Yellow for slightly bearish
-    # elif confidence_level < 20:
-    #     bar_color = "info"     # Blue for neutral
-    # elif confidence_level < 50:
-    #     bar_color = "primary"  # Light green for slightly bullish
-    # else:
-    #     bar_color = "success"  # Green for very bullish
-    # Determine bar color based on confidence level
     if confidence_level < 0:
         bar_color = "danger"  # Vermelho para qualquer valor negativo (bearish)
     elif confidence_level > 0:
         bar_color = "success"  # Verde para qualquer valor positivo (bullish)
     else:
         bar_color = "info"     # Azul para neutro (exatamente zero)
+    
     # Format reasoning text with improved styling
     reasoning_html = []
     
@@ -912,6 +905,28 @@ def update_dashboard(n_intervals, n_clicks, last_analysis):
     # Extract key factors from the reasoning
     key_factors_html = extract_key_factors(llm_reasoning)
     
+    # Format past market context from initial_market_context
+    past_market_context_html = []
+    if use_initial_context_enabled and initial_market_context:
+        try:
+            # Try to parse as JSON first
+            context_data = json.loads(initial_market_context)
+            # Format as a set of key-value pairs
+            for key, value in context_data.items():
+                formatted_key = key.replace("_", " ").title()
+                past_market_context_html.append(html.Div([
+                    html.Strong(f"{formatted_key}: ", className="text-info"),
+                    html.Span(f"{value}")
+                ], className="mb-2"))
+        except:
+            # If it's not valid JSON, display as text paragraphs
+            paragraphs = initial_market_context.split("\n")
+            for para in paragraphs:
+                if para.strip():
+                    past_market_context_html.append(html.P(para))
+    else:
+        past_market_context_html = [html.P("Initial market context is disabled or not available.", className="text-muted")]
+
     # Store the latest analysis for reference
     current_analysis = {
         "reasoning": llm_reasoning,
@@ -920,7 +935,8 @@ def update_dashboard(n_intervals, n_clicks, last_analysis):
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     
-    return position_text, pnl_text, direction_text, confidence_bar_value, bar_color, reasoning_html, confidence_value_html, key_factors_html, current_analysis
+    return position_text, pnl_text, direction_text, confidence_bar_value, bar_color, reasoning_html, confidence_value_html, key_factors_html, past_market_context_html, current_analysis
+
 
 def extract_key_factors(reasoning_text):
     """Extract key factors from reasoning text and format as bullet points"""
@@ -1672,7 +1688,15 @@ app.layout = dbc.Container([
             ], className="mb-4"),
         ], width=12),
     ]),
-    
+    dbc.Row([
+    dbc.Col([
+        html.H5("Past Market Context (H4):"),
+        html.Div(
+            id="past-market-context",
+            className="mt-2"
+        ),
+    ], width=12),
+    ]),
     dbc.Row([
         dbc.Col([
             dbc.Card([
