@@ -7,7 +7,9 @@ import os
 load_dotenv()
 
 
-
+from langchain_community.callbacks.manager import get_openai_callback
+import threading
+import time
 import os
 import json
 import time
@@ -41,6 +43,8 @@ from utils import parse_llm_response, format_trade_for_feedback, calculate_posit
 # Add this with other global variables near the top
 initial_market_context = None
 use_initial_context_enabled = False
+token_usage = {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
+last_token_print_time = time.time()
 # Custom CSS para melhorar a aparência da interface
 app_css = """
 /* Chat styles */
@@ -318,6 +322,21 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
      State("symbol-input", "value"),
      State("timeframe-dropdown", "value")]
 )
+def print_token_usage():
+    """Print token usage every minute"""
+    global token_usage, last_token_print_time
+    
+    while True:
+        current_time = time.time()
+        if current_time - last_token_print_time >= 60:
+            print(f"\n===== TOKEN USAGE REPORT =====")
+            print(f"Total tokens used: {token_usage['total_tokens']}")
+            print(f"Prompt tokens: {token_usage['prompt_tokens']}")
+            print(f"Completion tokens: {token_usage['completion_tokens']}")
+            print(f"Estimated cost (USD): ${(token_usage['prompt_tokens'] * 0.0000015 + token_usage['completion_tokens'] * 0.000002):.4f}")
+            print(f"===============================\n")
+            last_token_print_time = current_time
+        time.sleep(1)
 
 def log_candle_data(symbol, timeframe, candle_data, analysis, file_path=None):
     """
@@ -656,7 +675,12 @@ def process_chat_query(query, symbol, timeframe):
     
     try:
         # Invoke the chain
+       with get_openai_callback() as cb:
         response = chat_chain.invoke({})
+        # Update token usage counters
+        token_usage["total_tokens"] += cb.total_tokens
+        token_usage["prompt_tokens"] += cb.prompt_tokens
+        token_usage["completion_tokens"] += cb.completion_tokens
         return response.content
         
     except Exception as e:
@@ -994,64 +1018,287 @@ def extract_key_factors(reasoning_text):
 
 # Modificação na função analyze_market para extrair mais informações
 def analyze_market(symbol, timeframe):
-    """Analyze market using LLM"""
+    """Analyze market using LLM with professional contract management reasoning"""
     global llm_reasoning, confidence_level, market_direction, llm_chain
-    global initial_market_context, use_initial_context_enabled
+    global initial_market_context, use_initial_context_enabled, trade_history
     
     # Verify positions and get position info
     positions = mt5.positions_get(symbol=symbol)
     position_info = ""
+    initial_entry_price = None
+    position_direction = "None"  # Default if no position
+    entry_time = None
     
     if positions and len(positions) > 0:
+        # Find the earliest position to determine initial entry
+        earliest_pos = min(positions, key=lambda p: p.time)
+        initial_entry_price = earliest_pos.price_open
+        entry_time = datetime.fromtimestamp(earliest_pos.time).strftime("%Y-%m-%d %H:%M")
+        
+        # Determine overall position direction
+        net_position = sum(pos.volume if pos.type == mt5.ORDER_TYPE_BUY else -pos.volume for pos in positions)
+        position_direction = "Long" if net_position > 0 else "Short" if net_position < 0 else "None"
+        
+        # Format position details
         for pos in positions:
-            position_type = "Long" if pos.type == mt5.ORDER_TYPE_BUY else "Short"
-            position_info += f"MT5 Position: {position_type} {pos.volume} contracts at {pos.price_open}, P&L: {pos.profit}\n"
+            pos_type = "Long" if pos.type == mt5.ORDER_TYPE_BUY else "Short"
+            pos_time = datetime.fromtimestamp(pos.time).strftime("%Y-%m-%d %H:%M")
+            position_info += f"Active {pos_type} position: {pos.volume} contracts at {pos.price_open:.4f} (entered {pos_time}), current P&L: ${pos.profit:.2f}\n"
     
-    # Get support resistance levels as string
-    sr_str = "\n".join([f"Level {i+1}: {level}" for i, level in enumerate(support_resistance_levels)])
+    # Get current tick data to determine current price
+    current_price = None
+    tick = mt5.symbol_info_tick(symbol)
+    if tick:
+        current_price = (tick.bid + tick.ask) / 2
     
-    # Get current market data
-    market_data = get_current_candle_data(symbol, timeframe)
+    # Analyze previous contract adjustments
+    contract_adjustments = []
+    if trade_history:
+        for i, trade in enumerate(trade_history):
+            if i > 0:  # Skip the first trade (initial entry)
+                adjustment_type = "Added" if trade["action"] == "ADD_CONTRACTS" else "Removed"
+                contract_adjustments.append({
+                    "type": adjustment_type,
+                    "contracts": trade["contracts"],
+                    "price": trade["price"],
+                    "timestamp": trade["timestamp"],
+                    "reason": f"LLM decision with confidence {trade.get('confidence', 'unknown')}"
+                })
     
-    # Add position information to context if available
-    if position_info:
-        # Try to add to context as JSON data
-        try:
-            context_dict = json.loads(market_data)
-            context_dict["mt5_positions"] = position_info
-            market_data = json.dumps(context_dict)
-        except:
-            # If that fails, just keep context as is
-            pass
+    # Get support resistance levels with context
+    if support_resistance_levels and current_price:
+        sr_levels_sorted = sorted(support_resistance_levels)
+        
+        # Identify nearest support and resistance
+        supports = [level for level in sr_levels_sorted if level < current_price]
+        resistances = [level for level in sr_levels_sorted if level > current_price]
+        
+        nearest_support = max(supports) if supports else None
+        nearest_resistance = min(resistances) if resistances else None
+        
+        # Format support/resistance levels with context
+        sr_lines = []
+        for level in sr_levels_sorted:
+            if level < current_price:
+                distance = ((current_price - level) / current_price) * 100
+                distance_pips = (current_price - level) * 10000  # Assuming 4 decimal places
+                sr_lines.append(f"Support level: {level:.4f} ({distance:.2f}% below current price, {distance_pips:.1f} pips)")
+            else:
+                distance = ((level - current_price) / current_price) * 100
+                distance_pips = (level - current_price) * 10000  # Assuming 4 decimal places
+                sr_lines.append(f"Resistance level: {level:.4f} ({distance:.2f}% above current price, {distance_pips:.1f} pips)")
+                
+        sr_str = "\n".join(sr_lines)
+    else:
+        sr_str = "No support/resistance levels defined"
+        nearest_support = None
+        nearest_resistance = None
+    
+    # Get current candle data
+    market_data_json = get_current_candle_data(symbol, timeframe)
+    market_data_dict = json.loads(market_data_json)
+    
+    # Extract key indicator values
+    current_atr = market_data_dict.get("indicators", {}).get("atr", 0)
+    current_entropy = market_data_dict.get("indicators", {}).get("directional_entropy", 0)
+    
+    # Get more historical data for trend analysis
+    history_data = mt5.copy_rates_from_pos(symbol, timeframe_dict.get(timeframe, mt5.TIMEFRAME_H4), 0, 20)
+    
+    # Analyze trend, volume, and breakouts
+    trend_analysis = ""
+    volume_analysis = ""
+    breakout_analysis = ""
+    
+    if history_data is not None and len(history_data) > 5:
+        df_history = pd.DataFrame(history_data)
+        df_history['time'] = pd.to_datetime(df_history['time'], unit='s')
+        
+        # Calculate indicators for analysis
+        df_history['atr'] = calculate_atr(df_history, period=14)
+        df_history['entropy'] = calculate_directional_entropy(df_history, period=14)
+        df_history['ema9'] = calculate_ema(df_history['close'], period=9)
+        
+        # Trend analysis
+        short_term_trend = "Bullish" if df_history['close'].iloc[-1] > df_history['ema9'].iloc[-1] else "Bearish"
+        medium_term_trend = "Bullish" if df_history['close'].iloc[-1] > df_history['close'].iloc[-10] else "Bearish"
+        
+        # Price change percentage
+        price_change_pct = ((df_history['close'].iloc[-1] - df_history['close'].iloc[-5]) / df_history['close'].iloc[-5]) * 100
+        
+        # Volume analysis
+        recent_volume = df_history['tick_volume'].iloc[-1]
+        avg_volume = df_history['tick_volume'].iloc[-10:].mean()
+        volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 0
+        
+        # ATR analysis
+        recent_atr = df_history['atr'].iloc[-1]
+        avg_atr = df_history['atr'].iloc[-10:].mean()
+        atr_ratio = recent_atr / avg_atr if avg_atr > 0 else 0
+        
+        # Breakout detection
+        possible_breakout = False
+        breakout_direction = "None"
+        
+        # Check if price recently crossed a support/resistance level
+        if nearest_support and nearest_resistance:
+            last_5_lows = df_history['low'].iloc[-5:].min()
+            last_5_highs = df_history['high'].iloc[-5:].max()
+            
+            # Support breakout (bearish)
+            if last_5_lows < nearest_support and df_history['low'].iloc[-6:-5].min() >= nearest_support:
+                possible_breakout = True
+                breakout_direction = "Bearish"
+            
+            # Resistance breakout (bullish)
+            if last_5_highs > nearest_resistance and df_history['high'].iloc[-6:-5].max() <= nearest_resistance:
+                possible_breakout = True
+                breakout_direction = "Bullish"
+        
+        # Format analyses
+        trend_analysis = f"""
+## Trend Analysis
+- Short-term trend (vs EMA9): {short_term_trend}
+- Medium-term trend (vs 10 periods ago): {medium_term_trend}
+- Price change (last 5 candles): {price_change_pct:.2f}%
+- Price relative to EMA9: {"Above" if df_history['close'].iloc[-1] > df_history['ema9'].iloc[-1] else "Below"}
+"""
+
+        volume_analysis = f"""
+## Volume Analysis
+- Current volume vs 10-period average: {volume_ratio:.2f}x {("HIGH" if volume_ratio > 1.5 else "NORMAL" if volume_ratio >= 0.7 else "LOW")}
+- Volume trend: {"Increasing" if df_history['tick_volume'].iloc[-1] > df_history['tick_volume'].iloc[-2] else "Decreasing"}
+"""
+
+        breakout_analysis = f"""
+## Volatility and Breakout Analysis
+- Current ATR vs 10-period average: {atr_ratio:.2f}x {("HIGH" if atr_ratio > 1.3 else "NORMAL" if atr_ratio >= 0.7 else "LOW")}
+- Current Entropy: {current_entropy:.4f} {("HIGH" if current_entropy > 0.7 else "NORMAL" if current_entropy >= 0.4 else "LOW")}
+- Potential breakout detected: {"Yes - " + breakout_direction if possible_breakout else "No"}
+"""
+    
+    # Format contract adjustment history
+    adjustment_history = ""
+    if contract_adjustments:
+        adjustment_history += "## Contract Adjustment History\n"
+        for adj in reversed(contract_adjustments[-5:]):  # Show last 5 adjustments
+            adjustment_history += f"- {adj['timestamp']}: {adj['type']} {adj['contracts']} contracts at {adj['price']:.4f}\n"
+    
+    # Prepare context for position management
+    position_context = ""
+    if initial_entry_price and current_price and position_direction != "None":
+        # Calculate metrics relevant to position management
+        price_vs_entry = None
+        if position_direction == "Long":
+            price_vs_entry = (current_price - initial_entry_price) / initial_entry_price * 100
+            price_vs_entry_pips = (current_price - initial_entry_price) * 10000
+        else:  # Short
+            price_vs_entry = (initial_entry_price - current_price) / initial_entry_price * 100
+            price_vs_entry_pips = (initial_entry_price - current_price) * 10000
+        
+        position_context = f"""
+## Position Management Context
+- Initial entry at: {initial_entry_price:.4f} ({entry_time}) - {position_direction} direction
+- Current price vs entry: {"+" if price_vs_entry > 0 else ""}{price_vs_entry:.2f}% ({price_vs_entry_pips:.1f} pips)
+- Position is currently: {"IN PROFIT" if price_vs_entry > 0 else "IN LOSS"}
+"""
+    
+    # Prepare contract adjustment reasoning framework
+    adjustment_framework = """
+## Contract Management Framework
+
+### Criteria for ADDING Contracts:
+1. Price is moving in favor of entry direction AND mathematical indicators confirm trend continuation
+2. A support/resistance level was broken with LOW ATR and HIGH VOLUME (trend continuation signal)
+3. Price broke and retested a support/resistance level with LOW ATR and LOW ENTROPY
+
+### Criteria for REMOVING Contracts:
+1. Price is moving against entry direction AND mathematical indicators suggest continued counter-movement
+2. Price reached a key support/resistance level with LOW ATR and HIGH ENTROPY (indecision at level)
+3. Price breaks a support/resistance against entry direction with HIGH ATR and LOW ENTROPY (strong breakout)
+
+### Additional Guidelines:
+- Never remove all contracts on minor retracements
+- Consider overall position P&L when making adjustments
+- Look for confluence of multiple factors before adjusting position
+- Consider recent adjustment history to avoid overtrading
+"""
     
     # Prepare context data, including historical context if enabled
     if use_initial_context_enabled and initial_market_context:
         # Get a small amount of recent context to supplement the historical view
-        recent_data = get_initial_context(symbol, timeframe, num_candles=2) #________________________________________________________________________________quantia de candles da analize a cada novo candle
+        recent_data = get_initial_context(symbol, timeframe, num_candles=2)
         
-        # Combine historical and recent context
+        # Combine all context elements for a professional position manager perspective
         context = f"""
-# Long-Term Historical Market Analysis (H4 Timeframe)
+# Position Management Analysis for {symbol}
+
+## Long-Term Market Structure (H4 Timeframe)
 {initial_market_context}
 
-# Recent Market Context ({timeframe} Timeframe)
+## Current Market Environment
+Timeframe: {timeframe}
+Current Price: {current_price:.4f}
+
+{position_context}
+
+{trend_analysis}
+
+{volume_analysis}
+
+{breakout_analysis}
+
+## Key Technical Levels
+{sr_str}
+
+{adjustment_history}
+
+{adjustment_framework}
+
+## Recent Market Context
 {recent_data}
 """
     else:
-        # If not using initial context, just use standard context
-        context = get_initial_context(symbol, timeframe, num_candles=2)
+        # If not using initial context, use a simplified version
+        recent_data = get_initial_context(symbol, timeframe, num_candles=5)
+        
+        context = f"""
+# Position Management Analysis for {symbol} ({timeframe})
+
+{position_context}
+
+{trend_analysis}
+
+{volume_analysis}
+
+{breakout_analysis}
+
+## Key Technical Levels
+{sr_str}
+
+{adjustment_history}
+
+{adjustment_framework}
+
+## Recent Market Context
+{recent_data}
+"""
     
     # Run LLM analysis using the existing chain
     try:
         # Use the existing llm_chain
-        response = llm_chain.invoke({
-            "context": context,
-            "market_data": market_data,
-            "support_resistance": sr_str,
-            "current_position": current_position,
-            "max_contracts": max_contracts
-        })
-        
+        with get_openai_callback() as cb:
+            response = llm_chain.invoke({
+                "context": context,
+                "market_data": market_data_json,  # Fixed variable name
+                "support_resistance": sr_str,
+                "current_position": current_position,
+                "max_contracts": max_contracts
+            })
+            # Update token usage counters
+            token_usage["total_tokens"] += cb.total_tokens
+            token_usage["prompt_tokens"] += cb.prompt_tokens
+            token_usage["completion_tokens"] += cb.completion_tokens
         # Process response as before
         response_text = response.content
         analysis = parse_llm_response(response_text)
@@ -2087,6 +2334,15 @@ def trigger_analysis(n_clicks, symbol, timeframe):
     
     return 0  # Reset clicks
 # Inside analyze_market function after getting the response
+def start_token_reporting():
+    """Start token usage reporting thread"""
+    token_thread = threading.Thread(target=print_token_usage)
+    token_thread.daemon = True
+    token_thread.start()
+    print("Token usage reporting started")
 
+# In your main block, before app.run:
 if __name__ == "__main__":
+    # Start token reporting
+    start_token_reporting()
     app.run(debug=True, port=8050)
