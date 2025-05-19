@@ -24,7 +24,10 @@ import threading
 import queue
 import re
 import warnings
+
+
 print(f"🔑 API KEY: {os.getenv('OPENAI_API_KEY')[:20]}... (parcial)")
+
 
 # Desativar avisos de depreciação
 warnings.filterwarnings("ignore")
@@ -313,6 +316,104 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
      State("symbol-input", "value"),
      State("timeframe-dropdown", "value")]
 )
+
+def log_candle_data(symbol, timeframe, candle_data, analysis, file_path=None):
+    """
+    Log candle data, indicator values, and LLM analysis to an Excel file
+    
+    Args:
+        symbol (str): Trading symbol
+        timeframe (str): Timeframe code (e.g. "H4")
+        candle_data (str): JSON string containing candle data
+        analysis (dict): Dictionary containing LLM analysis
+        file_path (str, optional): Path to save the Excel file. If None, a default path is used.
+    """
+    # Use default file path if none provided
+    if file_path is None:
+        file_path = f"metatradebot_log_{symbol}_{timeframe}.xlsx"
+    
+    # Parse candle data JSON
+    try:
+        candle_dict = json.loads(candle_data)
+    except:
+        print(f"Error parsing candle data JSON: {candle_data}")
+        return
+    
+    # Create a data dictionary for this entry
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Extract OHLC data
+    ohlc = candle_dict.get("ohlc", {})
+    
+    # Extract indicator values
+    indicators = candle_dict.get("indicators", {})
+    
+    # Extract price action data
+    price_action = candle_dict.get("price_action", {})
+    
+    # Combine all data into a single row
+    data = {
+        "timestamp": timestamp,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candle_time": candle_dict.get("timestamp", ""),
+        
+        # OHLC data
+        "open": ohlc.get("open", 0),
+        "high": ohlc.get("high", 0),
+        "low": ohlc.get("low", 0),
+        "close": ohlc.get("close", 0),
+        "volume": candle_dict.get("volume", 0),
+        
+        # Indicator values
+        "atr": indicators.get("atr", 0),
+        "directional_entropy": indicators.get("directional_entropy", 0),
+        "ema9": indicators.get("ema9", 0),
+        
+        # Price action
+        "candle_type": price_action.get("candle_type", ""),
+        "candle_size": price_action.get("candle_size", 0),
+        "upper_wick": price_action.get("upper_wick", 0),
+        "lower_wick": price_action.get("lower_wick", 0),
+        
+        # Patterns
+        "patterns": ", ".join(candle_dict.get("price_patterns", [])),
+        
+        # LLM analysis
+        "market_summary": analysis.get("market_summary", ""),
+        "confidence_level": analysis.get("confidence_level", 0),
+        "direction": analysis.get("direction", "Neutral"),
+        "action": analysis.get("action", "WAIT"),
+        "contracts_to_adjust": analysis.get("contracts_to_adjust", 0),
+        "reasoning": analysis.get("reasoning", "")
+    }
+    
+    # Create DataFrame with this row
+    df_row = pd.DataFrame([data])
+    
+    # Check if file exists
+# Check if file exists
+    if os.path.exists(file_path):
+        # Read existing Excel file
+        try:
+            existing_df = pd.read_excel(file_path)
+            # Append new row
+            updated_df = pd.concat([existing_df, df_row], ignore_index=True)
+        except Exception as e:
+            print(f"Error reading existing Excel file: {e}")
+            updated_df = df_row
+    else:
+        # Create new DataFrame if file doesn't exist
+        updated_df = df_row
+
+    # Save to Excel
+    try:
+        updated_df.to_excel(file_path, index=False)
+        print(f"Logged candle data to {file_path}")
+    except Exception as e:
+        print(f"Error saving to Excel: {e}")
+
+
 def update_chat(send_clicks, input_submit, sug1, sug2, sug3, sug4,
                chat_input, chat_messages, chat_history, symbol, timeframe):
     """Updates the chat when the user sends a message"""
@@ -1177,7 +1278,7 @@ def trading_loop(symbol, timeframe):
     # Keep track of the last processed candle time
     last_candle_time = None
     
-    # Verificar posições existentes ao iniciar
+    # Verify existing positions at startup
     positions = mt5.positions_get(symbol=symbol)
     if positions:
         print(f"Found {len(positions)} existing positions for {symbol}")
@@ -1196,13 +1297,18 @@ def trading_loop(symbol, timeframe):
                     print(f"New candle detected at {current_candle_time}")
                     last_candle_time = current_candle_time
                     
+                    # Get current candle data
+                    candle_data = get_current_candle_data(symbol, timeframe)
+                    
                     # Perform market analysis
                     analysis = analyze_market(symbol, timeframe)
                     print(f"Market analysis: {analysis['market_summary']}")
                     print(f"Confidence: {analysis['confidence_level']}, Direction: {analysis['direction']}")
                     
-                    # Se a confiança estiver além de um limiar, execute automaticamente
-                    if abs(analysis['confidence_level']) > 50:  # Limiar de confiança
+                    # Log candle data and analysis to Excel
+                    log_candle_data(symbol, timeframe, candle_data, analysis)
+                    # If confidence exceeds threshold, execute automatically
+                    if abs(analysis['confidence_level']) > 50:  # Confidence threshold
                         print(f"Confidence level {analysis['confidence_level']} exceeds threshold. Executing trade...")
                         contracts_to_adjust = min(
                             analysis['contracts_to_adjust'],
@@ -1220,8 +1326,14 @@ def trading_loop(symbol, timeframe):
                 user_input = trade_queue.get_nowait()
                 print(f"Processing user input: {user_input}")
                 
+                # Get current candle data
+                candle_data = get_current_candle_data(symbol, timeframe)
+                
                 # Analyze market
                 analysis = analyze_market(symbol, timeframe)
+                
+                # Log candle data and analysis to Excel (for manual analysis as well)
+                log_candle_data(symbol, timeframe, candle_data, analysis, file_path=f"metatradebot_manual_log_{symbol}_{timeframe}.xlsx")
                 
                 # Execute trade based on analysis
                 if analysis['action'] != "WAIT":
@@ -1255,9 +1367,9 @@ def trading_loop(symbol, timeframe):
                 # No user input, continue with regular updates
                 pass
             
-            # Atualizar posições a cada 30 segundos
+            # Update positions every 30 seconds
             if int(time.time()) % 30 == 0:
-                # Verificar posições no MetaTrader5
+                # Check positions in MetaTrader5
                 positions = mt5.positions_get(symbol=symbol)
                 if positions:
                     mt_position_size = sum(pos.volume for pos in positions)
@@ -1266,14 +1378,14 @@ def trading_loop(symbol, timeframe):
                         print(f"Updating internal position to match MT5: {mt_position_size}")
                         current_position = mt_position_size
                         
-                    # Atualizar P&L com dados reais
+                    # Update P&L with real data
                     mt_pnl = sum(pos.profit for pos in positions)
-                    if abs(mt_pnl - total_pnl) > 0.01:  # Se houver diferença significativa
+                    if abs(mt_pnl - total_pnl) > 0.01:  # If there's a significant difference
                         print(f"P&L discrepancy detected: MT5=${mt_pnl:.2f}, Bot=${total_pnl:.2f}")
                         print(f"Updating internal P&L to match MT5: ${mt_pnl:.2f}")
                         total_pnl = mt_pnl
                 else:
-                    # Se não houver posições, e o bot acha que ainda tem, ajustar
+                    # If there are no positions, and the bot thinks it still has, adjust
                     if current_position != 0:
                         print(f"No positions found in MT5, but bot thinks it has {current_position}. Resetting to 0.")
                         current_position = 0
@@ -1286,7 +1398,7 @@ def trading_loop(symbol, timeframe):
             print(f"Error in trading loop: {e}")
             import traceback
             traceback.print_exc()
-            time.sleep(5)  
+            time.sleep(5) 
             
 app.layout = dbc.Container([
     dbc.Row([
