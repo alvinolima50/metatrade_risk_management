@@ -1745,6 +1745,7 @@ def update_sr_levels(sr_input):
     except ValueError:
         return [html.P("Invalid input. Use comma-separated numbers.", className="text-danger")]
 
+
 @app.callback(
     Output("price-chart", "figure"),
     [Input("interval-component", "n_intervals")],
@@ -1815,7 +1816,23 @@ def update_price_chart(n_intervals, symbol, timeframe):
             subplot_titles=("Price", "Indicators")
         )
         
-        # Add candlestick chart
+        # Create custom hover text with indicators included
+        hovertext = []
+        for i in range(len(df)):
+            date_str = df['time'].iloc[i].strftime('%b %d, %Y, %H:%M')
+            hover_info = (
+                f"Date: {date_str}<br>" +
+                f"Open: {df['open'].iloc[i]:.4f}<br>" +
+                f"High: {df['high'].iloc[i]:.4f}<br>" +
+                f"Low: {df['low'].iloc[i]:.4f}<br>" +
+                f"Close: {df['close'].iloc[i]:.4f}<br>" +
+                f"ATR: {df['atr'].iloc[i]:.4f}<br>" + 
+                f"Entropy: {df['entropy'].iloc[i]:.4f}<br>" +
+                f"EMA9: {df['ema9'].iloc[i]:.4f}"
+            )
+            hovertext.append(hover_info)
+        
+        # Add candlestick chart with custom hoverinfo
         fig.add_trace(
             go.Candlestick(
                 x=df['time'],
@@ -1823,12 +1840,14 @@ def update_price_chart(n_intervals, symbol, timeframe):
                 high=df['high'],
                 low=df['low'],
                 close=df['close'],
-                name="Price"
+                name="Price",
+                hoverinfo="text",
+                hovertext=hovertext,
             ),
             row=1, col=1
         )
         
-        # Add EMA
+        # Add EMA with standard hover (no customization needed)
         fig.add_trace(
             go.Scatter(
                 x=df['time'],
@@ -1922,7 +1941,8 @@ def update_price_chart(n_intervals, symbol, timeframe):
             margin=dict(l=50, r=50, t=80, b=50),
             template="plotly_dark",
             xaxis_rangeslider_visible=False,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            hovermode="closest"
         )
         
         # Set y-axis titles
@@ -1944,7 +1964,6 @@ def update_price_chart(n_intervals, symbol, timeframe):
             font=dict(size=14, color="red")
         )
         return fig
-
 @app.callback(
     [Output("max-contracts-input", "disabled")],
     [Input("start-button", "n_clicks")],
