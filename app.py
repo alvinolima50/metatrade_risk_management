@@ -28,7 +28,15 @@ import re
 import warnings
 from prompts import initial_context_prompt
 
-print(f"🔑 API KEY: {os.getenv('OPENAI_API_KEY')[:20]}... (parcial)")
+import os
+from dotenv import load_dotenv
+import sys
+
+load_dotenv()  # Carrega .env
+
+print("🔐 OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
+print("🐍 Python path:", sys.executable)
+
 
 
 # Desativar avisos de depreciação
@@ -630,7 +638,7 @@ def process_chat_query(query, symbol, timeframe):
         initialize_llm_chain()
     
     # Get historical data for context
-    historical_context = get_initial_context(symbol, timeframe, num_candles=20)
+    historical_context = get_initial_context(symbol, timeframe, num_candles=10)
     
     # Get current candle data
     current_data = get_current_candle_data(symbol, timeframe)
@@ -1262,7 +1270,7 @@ def update_trade_history(n_intervals):
         history_cards.append(card)
     
     return history_cards
-def get_initial_context(symbol, timeframe, num_candles=3):
+def get_initial_context(symbol, timeframe, num_candles=15):
     """Get initial market context for LLM"""
     if timeframe not in timeframe_dict:
         return "Invalid timeframe"
@@ -2165,7 +2173,7 @@ def control_trading(start_clicks, stop_clicks, symbol, timeframe, use_context):
             try:
                 print("Getting initial market context...")
                 # Get historical data for H4 timeframe
-                historical_data = get_initial_context(symbol, "H4", num_candles=3)#__________________________________________________________ quantia de candles para a analize H4 do langchain
+                historical_data = get_initial_context(symbol, "H4", num_candles=15)#__________________________________________________________ quantia de candles para a analize H4 do langchain
                 print("\n====== EXACT DATA BEING SENT TO LLM FOR H4 ANALYSIS ======")
                 print(historical_data)
                 print("\n====== END OF EXACT DATA ======\n")
